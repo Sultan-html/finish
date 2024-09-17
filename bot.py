@@ -1,21 +1,16 @@
-import asyncio
-import logging
 from aiogram import Bot, Dispatcher
-
-from app.handler import router
-from aiogram.fsm import FSMContext
-
+import logging
+import asyncio
+from app.handler import *
 
 bot = Bot(token='7406747195:AAHApFoswG0YtG-iClZp3OJ8H5ODzo631J0')
-dp = Dispatcher(bot)
-
+dp = Dispatcher()
 async def main():
-    try:
-        dp.include_router(router)
-        await dp.start_polling()
-    except Exception as e:
-        logging.error(f"An error occurred: {e}")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Exit")

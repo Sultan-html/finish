@@ -1,6 +1,6 @@
 from aiogram import Bot, Dispatcher,F
 from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup
-from aiogram.filters import Command, CommandStart
+
 
 
 buttons = [

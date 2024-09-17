@@ -1,50 +1,63 @@
+import aiomysql
 import asyncio
-import logging
-from aiogram import types,Bot,Dispatcher,F,Router
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.dispatcher import FSMContext
-from aiogram.filters import Command
-from database import get_db_connection, init_db
+from aiogram import types, Router
 from app.keyboard import *
-
+from aiogram.filters import Command, CommandStart
 router = Router()
 
-class TransferState(StatesGroup):
-    waiting_for_amount = State()
-    waiting_for_recipient = State()
-    waiting_for_name = State()
+user_interactions = {}
+db_config = {
+    'host': 'localhost',
+    'port': 3306,
+    'user': 'root',
+    'password': 'password',
+    'db': 'bank_db'
+}
 
+async def get_db_pool():
+    return await aiomysql.create_pool(**db_config)
 
+@router.message(CommandStart())
 async def start(message: types.Message):
     await message.answer("""Привет! Я бот для банковских переводов. Команды, которые я поддерживаю:\n
         /balance - узнать текущий баланс\n
         /transfer - перевести средства\n
         /register - зарегистрировать имя""", reply_markup=keybord)
 
-
+@router.message(Command('register'))
 async def register(message: types.Message):
-    await message.answer('Введите ваше имя для регистрации:')
-    await TransferState.waiting_for_name.set()
-
-async def register_name(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    user_name = message.text
-    
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('INSERT OR REPLACE INTO users (id, name) VALUES (?, ?)', (user_id, user_name))
-        conn.commit()
+    user_interactions[user_id] = {'state': 'waiting_for_name'}
+    await message.answer('Введите ваше имя для регистрации:')
 
-    await message.answer("Вы успешно зарегистрированы!")
-    await state.finish()
+@router.message()
+async def handle_registration(message: types.Message):
+    user_id = message.from_user.id
+    if user_id in user_interactions and user_interactions[user_id].get('state') == 'waiting_for_name':
+        user_name = message.text
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute('INSERT INTO users (id, name) VALUES (%s, %s) ON DUPLICATE KEY UPDATE name=%s', (user_id, user_name, user_name))
+                await conn.commit()
 
+        await message.answer("Вы успешно зарегистрированы!")
+        user_interactions.pop(user_id, None)
+    elif user_id in user_interactions and user_interactions[user_id].get('state') == 'waiting_for_amount':
+        await handle_transfer_amount(message)
+    elif user_id in user_interactions and user_interactions[user_id].get('state') == 'waiting_for_recipient':
+        await handle_transfer_recipient(message)
+    else:
+        await message.answer("Команда не распознана.")
+
+@router.message(Command('balance'))
 async def balance(message: types.Message):
     user_id = message.from_user.id
-
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT balance FROM users WHERE id = ?', (user_id,))
-        result = cursor.fetchone()
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute('SELECT balance FROM users WHERE id = %s', (user_id,))
+            result = await cursor.fetchone()
 
     if result:
         balance = result[0]
@@ -52,60 +65,64 @@ async def balance(message: types.Message):
     else:
         await message.answer('У вас нет зарегистрированного счета. Пожалуйста, зарегистрируйтесь с помощью команды /register')
 
-
+@router.message(Command('transfer'))
 async def transfer_start(message: types.Message):
-    await message.answer('Введите сумму для перевода:')
-    await TransferState.waiting_for_amount.set()
-
-async def transfer_amount(message: types.Message, state: FSMContext):
-    try:
-        amount = float(message.text)
-        if amount <= 0:
-            raise ValueError("Сумма должна быть положительной.")
-        
-        user_id = message.from_user.id
-
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT balance FROM users WHERE id = ?', (user_id,))
-            result = cursor.fetchone()
-
-        if not result or result[0] < amount:
-            await message.answer('Недостаточно средств на счете.')
-            await state.finish()
-            return
-
-        await state.update_data(amount=amount)
-        await message.answer('Введите ID получателя:')
-        await TransferState.waiting_for_recipient.set()
-    except ValueError:
-        await message.answer('Ошибка: введите корректную сумму.')
-
-async def transfer_recipient(message: types.Message, state: FSMContext):
-    recipient_id = message.text
-    user_data = await state.get_data()
-    amount = user_data.get('amount')
-
-    if not amount:
-        await message.answer('Ошибка: сумма не установлена.')
-        await state.finish()
-        return
-
     user_id = message.from_user.id
+    user_interactions[user_id] = {'state': 'waiting_for_amount'}
+    await message.answer('Введите сумму для перевода:')
 
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT id FROM users WHERE id = ?', (recipient_id,))
-        recipient_exists = cursor.fetchone() is not None
+async def handle_transfer_amount(message: types.Message):
+    user_id = message.from_user.id
+    if user_id in user_interactions and user_interactions[user_id].get('state') == 'waiting_for_amount':
+        try:
+            amount = float(message.text)
+            if amount <= 0:
+                raise ValueError("Сумма должна быть положительной.")
+            
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute('SELECT balance FROM users WHERE id = %s', (user_id,))
+                    result = await cursor.fetchone()
 
-        if not recipient_exists:
-            await message.answer('Получатель не найден. Пожалуйста, проверьте ID.')
-            await state.finish()
+            if not result or result[0] < amount:
+                await message.answer('Недостаточно средств на счете.')
+                user_interactions.pop(user_id, None)
+                return
+
+            user_interactions[user_id]['amount'] = amount
+            user_interactions[user_id]['state'] = 'waiting_for_recipient'
+            await message.answer('Введите ID получателя:')
+        except ValueError:
+            await message.answer('Ошибка: введите корректную сумму.')
+
+async def handle_transfer_recipient(message: types.Message):
+    user_id = message.from_user.id
+    if user_id in user_interactions and user_interactions[user_id].get('state') == 'waiting_for_recipient':
+        recipient_id = message.text
+        amount = user_interactions[user_id].get('amount')
+
+        if not amount:
+            await message.answer('Ошибка: сумма не установлена.')
+            user_interactions.pop(user_id, None)
             return
 
-        cursor.execute('UPDATE users SET balance = balance - ? WHERE id = ?', (amount, user_id))
-        cursor.execute('UPDATE users SET balance = balance + ? WHERE id = ?', (amount, recipient_id))
-        conn.commit()
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute('SELECT id FROM users WHERE id = %s', (recipient_id,))
+                recipient_exists = await cursor.fetchone() is not None
 
-    await message.answer(f'Перевод {amount} сомов успешно выполнен на счет {recipient_id}.')
-    await state.finish()
+                if not recipient_exists:
+                    await message.answer('Получатель не найден. Пожалуйста, проверьте ID.')
+                    user_interactions.pop(user_id, None)
+                    return
+
+                await cursor.execute('UPDATE users SET balance = balance - %s WHERE id = %s', (amount, user_id))
+                await cursor.execute('UPDATE users SET balance = balance + %s WHERE id = %s', (amount, recipient_id))
+                await conn.commit()
+
+        await message.answer(f'Перевод {amount} сомов успешно выполнен на счет {recipient_id}.')
+        user_interactions.pop(user_id, None)
+    else:
+        await message.answer("Вы не находитесь в процессе перевода.")
